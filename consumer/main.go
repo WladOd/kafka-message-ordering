@@ -2,51 +2,77 @@ package main
 
 import (
 	"context"
+	"flag"
+	"log"
+	"time"
 
 	kafka "github.com/segmentio/kafka-go"
 )
 
+const (
+	address = "localhost:29092"
+	topic   = "myTopic"
+)
+
 func main() {
-	
+	grpID := flag.String("group", "", "a string")
+	partn := flag.Int("partition", 0, "kafka partition")
+	flag.Parse()
+	if *grpID != "" && *partn != 0 {
+		log.Fatalln(`If "GroupID" is specified then "Partition" should NOT be specified for kafka consumer`)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	consum := GetUsersKconsumer(ctx, address, *grpID, *partn)
+	go consum.Fetch()
+	time.Sleep(5 * time.Minute)
+	cancel()
 }
 
-type producer struct {
-	w      *kafka.Writer
-	ctx   context.Context
+type consumer struct {
+	r   *kafka.Reader
+	ctx context.Context
 }
 
-func NewKafkaProducer(topic, address string) *producer {
-	return &producer{
-		w: &kafka.Writer{
-			Addr:     kafka.TCP(address),
-			Topic:    topic,
-			Balancer: &kafka.LeastBytes{},
-		},
-		ctx:  context.Background(),
+func GetUsersKconsumer(ctx context.Context, address, groupID string, ptn int) *consumer {
+
+	return &consumer{
+		r: kafka.NewReader(kafka.ReaderConfig{
+			Brokers:   []string{address},
+			GroupID:   groupID,
+			Topic:     topic,
+			Partition: ptn,
+			// MinBytes: 1e3, // 10KB
+			// MaxBytes: 10e6, // 10MB
+		}),
+		ctx: ctx,
 	}
 }
 
-func (kp *producer) Produce(msgs ...kafka.Message) bool {
-	ctx, close := context.WithCancel(kp.ctx)
-	defer close()
+func (c *consumer) Fetch() {
+	for {
+		select {
+		case <-c.ctx.Done():
+			log.Println("consumer interupted by context")
+			return
+		default:
+			ctx, close := context.WithCancel(c.ctx)
+			defer close()
 
-	err := kp.w.WriteMessages(ctx, msgs...)
-	if err != nil {
-		return false
-	}
+			m, err := c.r.FetchMessage(ctx)
+			if err != nil {
+				log.Println(`consumer failed to fetch messages: `, err.Error())
+				close()
+				continue
+			}
+			log.Printf(`consumer fetch message - "%s" : "%s" - partition "%d" `, string(m.Key), string(m.Value), m.Partition)
 
-	if err := kp.w.Close(); err != nil {
-		return false
+			if c.r.Config().GroupID != "" {
+				if err := c.r.CommitMessages(ctx, m); err != nil {
+					log.Println(`consumer failed to commit messages: `, err.Error())
+				}
+			}
+			close()
+		}
 	}
-	return true
-}
-func (kp *producer) EnsureTopic(address, topic string) bool {
-	ctx, close := context.WithCancel(kp.ctx)
-	defer close()
-
-	_, err := kafka.DialLeader(ctx, "tcp", address, topic, 0)
-	if err != nil {
-		return false
-	}
-	return true
 }
